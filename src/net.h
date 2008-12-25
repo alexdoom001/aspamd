@@ -10,6 +10,7 @@
 #define _ASPAMD_NET_
 
 #include <poll.h>
+#include <assassin.h>
 
 #define ASPAMD_NET_MAX_CON			(256)
 #define ASPAMD_NET_POLL_TIMEOUT			(512)
@@ -17,14 +18,24 @@
 /** structure to keep client session data */
 struct aspamd_session
 {
+	gint state;
+	/*!< state of the session */
 	int socket;
 	/*!< socket file descriptor */
-	gchar *header_buffer;
-	/*!< buffer to read message header */
-	gint header_offset;
-	/*!< offset in the header buffer */
+	gchar *buffer;
+	/*!< buffer to keep incoming data */
+	gint size;
+	/*!< buffer size */
+	gint filling;
+	/*!< filling in the header buffer */
+	gint offset;
+	/*!< offset to run parser */
 	struct aspamd_server *parent;
 	/*!< pointer to server which accepted this session*/
+	struct assassin_parser *parser;
+	/*!< parser to parse incoming data */
+	gint head_allocated;
+	/*!< buffer is allocated by g_slice_new routine */
 };
 
 typedef struct aspamd_session aspamd_session_t;

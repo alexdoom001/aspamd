@@ -69,7 +69,7 @@ static char *msg_type_to_str[] =
 
 static gint assassin_hdr_printf (assassin_header_t *header, gchar *buffer, gint size)
 {
-	gint bytes_written;
+	gint bytes_written = 0;
 	/* for spam header decoding */
 	gboolean spam;
 	gint numerator, denominator;
@@ -93,11 +93,11 @@ static gint assassin_hdr_printf (assassin_header_t *header, gchar *buffer, gint 
 	}
 	else if (header->type == assassin_hdr_spam)
 	{
+		g_variant_get (header->value, "(bii)", &spam, &numerator, &denominator);
 		if (spam)
 			str = "true";
 		else
 			str = "false";
-		g_variant_get (header->value, "(bii)", &spam, &numerator, &denominator);
 		bytes_written = snprintf (buffer, size, "%s: %s ; %i / %i\r\n",
 					  hdr_type_to_str[header->type],
 					  str, numerator, denominator);
@@ -151,6 +151,7 @@ gint assassin_msg_allocate (assassin_message_t **new_message, gint type, gint co
 {
 	gint ret = ASPAMD_ERR_OK;
 	assassin_message_t *message = NULL;
+	gchar *cmd = NULL;
 
 	message = g_slice_new (assassin_message_t);
 	if (!message)
@@ -165,6 +166,7 @@ gint assassin_msg_allocate (assassin_message_t **new_message, gint type, gint co
 	message->version_minor = minor;
 	message->content.buffer = NULL;
 	message->content.auto_free = 0;
+	message->headers = NULL;
 
 at_exit:
 	if (ret == ASPAMD_ERR_OK)
@@ -174,8 +176,12 @@ at_exit:
 		*new_message = NULL;
 		assassin_msg_free (message);
 	}
+	if (command > 0)
+		cmd = command_to_str[command];
+	else
+		cmd = "empty";
 	g_debug ("new message %p, type - %s, command - %s", message, msg_type_to_str[type],
-		command_to_str[command]);
+		 cmd);
 		
 	return ret;
 }
@@ -289,6 +295,9 @@ gint assassin_msg_printf (assassin_message_t *message, gpointer *data, gint *fil
 	gchar *buffer = NULL, *offset = NULL;
 	GSList *iter = message->headers;
 	assassin_header_t *header;
+	gchar *body = NULL;
+	gint body_size;
+	gchar *error_str = NULL;
 
 	g_assert (message && data && filling);
 
@@ -311,12 +320,15 @@ gint assassin_msg_printf (assassin_message_t *message, gpointer *data, gint *fil
 		goto at_exit;
 	}
 
+	if (message->command != assassin_cmd_ping || message->error != assassin_ex_ok)
+		error_str = assassin_error_to_string (message->error);
+	else
+		error_str = "PONG";
+
 	bytes_written = snprintf (offset, size,
 				  "SPAMD/%i.%i %i %s\r\n",
-				  message->version_major,
-				  message->version_minor,
-				  message->error,
-				  assassin_error_to_string (message->error));
+				  message->version_major, message->version_minor,
+				  message->error, error_str);
 
 	g_assert (bytes_written > 0);
 	offset += bytes_written;
@@ -329,28 +341,38 @@ gint assassin_msg_printf (assassin_message_t *message, gpointer *data, gint *fil
 		header = (assassin_header_t*)iter->data;
 		bytes_written = assassin_hdr_printf(header, offset, size);
 		g_assert (bytes_written > 0);
+		if (bytes_written > size)
+		{
+			g_critical ("buffer size is exceeded");
+			ret = ASPAMD_ERR_MSG;
+			goto at_exit;
+		}
 		offset += bytes_written;
 		size -= bytes_written;
 	}
 
+	body_size = 3;
 	if (message->content.buffer)
 	{
-		bytes_written = snprintf (offset, size,
-					  "\r\n%s",
-					  (gchar *) message->content.buffer +
-					  message->content.offset);
-		g_assert (bytes_written > 0);
-		offset += bytes_written;
-		size -= bytes_written;
+		body = (gchar *) message->content.buffer + message->content.offset;
+		body_size += message->content.size;
 	}
+	else
+		body = "";
 
-	if (offset == buffer + size)
+	/* I should take into account '\0' character or message body
+	 * will be truncated */
+	bytes_written = snprintf (offset, MIN(size, body_size),
+				  "\r\n%s", body);
+	g_assert (bytes_written > 0);
+	if (bytes_written > size)
 	{
-		g_critical ("message has been truncated, please adjust\
-ASPAMD_SESSION_MAX_HEADER_SIZE variable ");
+		g_critical ("buffer size is exceeded");
 		ret = ASPAMD_ERR_MSG;
 		goto at_exit;
 	}
+	offset += bytes_written;
+	size -= bytes_written;
 
 at_exit:
 	if (ret == ASPAMD_ERR_OK)
@@ -381,6 +403,8 @@ void assassin_msg_free (assassin_message_t *message)
 	assassin_header_t *header;
 
 	g_assert (message);
+
+	g_debug ("message %p is about to be released", message);
 
 	if (message->headers)
 	{

@@ -21,6 +21,8 @@ struct assassin_parser
 		 * look at #assassin_message_type for details */
 		body_size;
 		/*!< size of the message body */
+	gboolean verbose;
+	/*!< be more talkative */
 	assassin_message_t *message;
 	/*!< parsed message */
 	GRegex *reg_exp;
@@ -28,7 +30,17 @@ struct assassin_parser
 
 typedef struct assassin_parser assassin_parser_t;
 
-gint assassin_parser_allocate (assassin_parser_t **new_parser, gint type);
+enum assassin_prs_state
+{
+	assassin_prs_1_line,
+	assassin_prs_headers,
+	assassin_prs_empty_line,
+	assassin_prs_body,
+	assassin_prs_finished,
+	assassin_prs_error
+};
+
+gint assassin_parser_allocate (assassin_parser_t **new_parser, gint type, gint verbose);
 gint assassin_parser_scan (assassin_parser_t *parser, const gchar *buffer, gint *offset,
 			   gint size, gint *completed, gint auto_free);
 void assassin_parser_reset (assassin_parser_t *parser);

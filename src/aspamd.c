@@ -13,10 +13,11 @@
 #include <string.h>
 #include <stdlib.h>
 #include <glib.h>
-#include "errors.h"
-#include "logging.h"
-#include "server.h"
-#include "aspamd.h"
+#include <errors.h>
+#include <logging.h>
+#include <server.h>
+#include <aspamd.h>
+#include <parser.h>
 
 static gchar *default_net_ip = ASPAMD_DEFAULT_NET_IP,
 	*default_log_path = ASPAMD_DEFAULT_LOG_PATH;
@@ -257,6 +258,11 @@ gint aspamd_load_config (aspamd_context_t *context)
 	context->server.port = g_key_file_get_integer (key_file, "net", "port", &gerr);
 	if (gerr)
 		g_critical ("key read net::port failed: %s", gerr->message);
+	if (context->server.port & ~G_MAXUINT16)
+	{
+		g_warning ("net::port value is to big");
+		context->server.port = 0;
+	}
 	if (gerr || ! context->server.port)
 	{
 		context->server.port = ASPAMD_DEFAULT_NET_PORT;
