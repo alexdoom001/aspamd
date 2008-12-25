@@ -10,11 +10,13 @@
 #include <logging.h>
 #include <errors.h>
 #include <parser.h>
+#include <config.h>
 
 /*-----------------------------------------------------------------------------*/
 
 gint message_to_string_test_1 ();
 gint message_to_string_test_2 ();
+gint message_to_string_test_3 ();
 gint string_to_message_test_1 ();
 gint string_to_message_test_2 ();
 gint string_to_message_test_3 ();
@@ -31,6 +33,7 @@ const struct
 }tests[] = {
 	{&message_to_string_test_1, "trivial message serialization test"},
 	{&message_to_string_test_2, "message serialization in case of buffer overflow"},
+	{&message_to_string_test_3, "message serialization test using content buffer"},
 	{&string_to_message_test_1, "trivial parser test"},
 	{&string_to_message_test_2, "growing buffer test"},
 	{&string_to_message_test_3, "bad patterns test"},
@@ -47,30 +50,26 @@ const gchar msg_to_string_1_output[] =
 gint message_to_string_test_1 ()
 {
 	gint	ret = ASPAMD_ERR_OK,
-		filling = 0,
 		pos;
 	assassin_message_t *message = NULL;
 	const gchar *content = "--processed message ";
-	gchar *buffer;
 	GVariant *dup_header;
+	assassin_buffer_t *buffer;
 
-	ret = assassin_msg_allocate (&message, assassin_msg_response, assassin_cmd_process,
-				     1, 4);
+	ret = assassin_msg_allocate (&message, assassin_msg_reply, NULL);
 	ASPAMD_ERR_CHECK (ret);
+	message->command = assassin_cmd_process;
 	message->error = assassin_ex_usage;
 	ret = assassin_msg_add_header (message, assassin_hdr_user,
 				       g_variant_new_string ("pavels"));
 	ASPAMD_ERR_CHECK (ret);
-	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
-				       g_variant_new_int32 (strlen (content)));
-	ASPAMD_ERR_CHECK (ret);
 
-	dup_header = g_variant_new_int32 (0xd34dbeaf);
-	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
-				       dup_header);
+	dup_header = g_variant_new_string ("duplicate");
+	ret = assassin_msg_add_header (message, assassin_hdr_user, dup_header);
 	if (ret != ASPAMD_ERR_MSG)
 	{
-		g_critical ("%s test failed, duplicating header is not rejected", __FUNCTION__);
+		g_critical ("%s test failed, duplicating header is not rejected",
+			    __FUNCTION__);
 		ret = ASPAMD_ERR_MSG;
 		goto at_exit;
 	}
@@ -84,10 +83,12 @@ gint message_to_string_test_1 ()
 	ret = assassin_msg_add_body (message, (gpointer) content, 0, strlen (content),
 				     FALSE);
 
-	ret = assassin_msg_printf (message, (gpointer *)&buffer, &filling);
+	ret = assassin_msg_print (message, &buffer, ASSASSIN_BUF_NEW);
 	ASPAMD_ERR_CHECK (ret);
 
-	if (strlen (msg_to_string_1_output) != filling)
+	g_debug ("%s", buffer->data + buffer->offset);
+
+	if (strlen (msg_to_string_1_output) != buffer->size)
 	{
 		g_critical ("%s test failed, output buffer filling is incorrect",
 			    __FUNCTION__);
@@ -95,7 +96,9 @@ gint message_to_string_test_1 ()
 		goto at_exit;
 	}
 
-	pos = g_ascii_strncasecmp (msg_to_string_1_output, buffer, filling);
+	pos = g_ascii_strncasecmp (msg_to_string_1_output,
+				   buffer->data + buffer->offset,
+				   buffer->size);
 
 	if (pos != 0)
 	{
@@ -108,7 +111,7 @@ at_exit:
 	if (message)
 		assassin_msg_free (message);
 	if (buffer)
-		g_free(buffer);
+		assassin_buffer_free(buffer);
 	return ret;
 }
 
@@ -116,29 +119,25 @@ at_exit:
 
 gint message_to_string_test_2 ()
 {
-	gint	ret = ASPAMD_ERR_OK,
-		filling = 0;
+	gint	ret = ASPAMD_ERR_OK;
 	assassin_message_t *message = NULL;
 	const gchar *content = "--processed message ";
-	gchar *buffer;
-	GVariant *dup_header;
+	GVariant *dup_header = NULL;
+	assassin_buffer_t *buffer = NULL;
 
-	ret = assassin_msg_allocate (&message, assassin_msg_response, assassin_cmd_process,
-				     1, 4);
+	ret = assassin_msg_allocate (&message, assassin_msg_reply, NULL);
 	ASPAMD_ERR_CHECK (ret);
 	message->error = assassin_ex_usage;
+	message->command = assassin_cmd_process;
 	ret = assassin_msg_add_header (message, assassin_hdr_user,
 				       g_variant_new_string ("very_long_value:\
 very_long_value:very_long_value:very_long_value:very_long_value:very_long_value:\
 very_long_value:very_long_value:very_long_value:very_long_value:very_long_value:\
 very_long_value"));
 	ASPAMD_ERR_CHECK (ret);
-	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
-				       g_variant_new_int32 (strlen (content)));
-	ASPAMD_ERR_CHECK (ret);
 
-	dup_header = g_variant_new_int32 (0xd34dbeaf);
-	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
+	dup_header = g_variant_new_string ("duplicate");
+	ret = assassin_msg_add_header (message, assassin_hdr_user,
 				       dup_header);
 	if (ret != ASPAMD_ERR_MSG)
 	{
@@ -156,7 +155,7 @@ very_long_value"));
 	ret = assassin_msg_add_body (message, (gpointer) content, 0, strlen (content),
 				     FALSE);
 
-	ret = assassin_msg_printf (message, (gpointer *)&buffer, &filling);
+	ret = assassin_msg_print (message, &buffer, ASSASSIN_BUF_NEW);
 
 	if (ret == ASPAMD_ERR_OK)
 	{
@@ -171,6 +170,73 @@ at_exit:
 		assassin_msg_free (message);
 	if (buffer)
 		g_free(buffer);
+	return ret;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+
+gint message_to_string_test_3 ()
+{
+	gint	ret = ASPAMD_ERR_OK,
+		pos;
+	assassin_message_t *message = NULL;
+	const gchar *content = "--processed message ";
+	assassin_buffer_t *buffer = NULL, *body = NULL;
+
+	ret = assassin_msg_allocate (&message, assassin_msg_reply, NULL);
+	ASPAMD_ERR_CHECK (ret);
+	message->error = assassin_ex_usage;
+	message->command = assassin_cmd_process;
+	ret = assassin_msg_add_header (message, assassin_hdr_user,
+				       g_variant_new_string ("pavels"));
+	ASPAMD_ERR_CHECK (ret);
+	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
+				       g_variant_new_int32 (strlen (content)));
+	ASPAMD_ERR_CHECK (ret);
+
+	ret = assassin_msg_add_header (message, assassin_hdr_spam,
+				       g_variant_new ("(bii)", TRUE, 10, 2));
+	ASPAMD_ERR_CHECK (ret);
+
+	ret = assassin_buffer_allocate (&body, ASSASSIN_MAX_HEAD_SIZE * 2);
+	ASPAMD_ERR_CHECK (ret);
+
+	body->offset = ASSASSIN_MAX_HEAD_SIZE;
+	strcpy (body->data + body->offset, content);
+	body->size = strlen (content);
+
+	assassin_msg_set_body(message, body);
+
+	ret = assassin_msg_print (message, &buffer, ASSASSIN_BUF_CONTENT);
+	ASPAMD_ERR_CHECK (ret);
+
+	g_debug ("%s", buffer->data + buffer->offset);
+
+	if (strlen (msg_to_string_1_output) != buffer->size)
+	{
+		g_critical ("%s test failed, output buffer filling is incorrect",
+			    __FUNCTION__);
+		ret = ASPAMD_ERR_MSG;
+		goto at_exit;
+	}
+
+	pos = g_ascii_strncasecmp (msg_to_string_1_output,
+				   buffer->data + buffer->offset,
+				   buffer->size);
+
+	if (pos != 0)
+	{
+		g_critical ("%s test failed, messages differ at %i", __FUNCTION__, pos);
+		ret = ASPAMD_ERR_ERR;
+		goto at_exit;
+	}
+
+at_exit:
+	if (message)
+		assassin_msg_free (message);
+	if (buffer)
+		assassin_buffer_free(buffer);
 	return ret;
 }
 
@@ -258,12 +324,9 @@ gint string_to_message_test_2 ()
 		goto at_exit;
 	}
 
-	body = g_strndup (msg->content.buffer + msg->content.offset,
-			  msg->content.size);
+	assassin_buffer_get_data (msg->content, (gpointer *)&body, &buffer_size);
 	g_debug ("body - %s", body);
 at_exit:
-	if (body)
-		g_free (body);
 	if (msg)
 		assassin_msg_free (msg);
 	return ret;
@@ -371,8 +434,7 @@ int main (int argc, char *argv[])
 
 	srandom (time (NULL));
 
-	ret = aspamd_logger_early_configure (&log);
-	ASPAMD_ERR_CHECK (ret);
+	aspamd_logger_early_configure (&log);
 
 	ret = assassin_parser_allocate (&parser, assassin_msg_request, 0);
 	ASPAMD_ERR_CHECK (ret);

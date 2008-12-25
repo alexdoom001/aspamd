@@ -1,0 +1,45 @@
+CC = gcc
+LD = gcc
+PKG_CONFIG = pkg-config
+
+ifndef KAS_DIR
+KAS_DIR =  ../KAS_SDK5
+endif
+
+ifdef DEBUG
+CFLAGS += -O0 -g3 -Wall -DASPAMD_NET_MAX_CON=6
+else
+CFLAGS += -O2 -g
+endif
+
+# glib-2.0 flags will be added by dependency
+CFLAGS += -m32 $(shell $(PKG_CONFIG) --cflags gthread-2.0) \
+	-I $(KAS_DIR)/include -Isrc -DG_LOG_DOMAIN=\"aspamd\" \
+
+LDFLAGS += -m32 -g \
+	-L/lib32 -Wl,-rpath,/lib32 \
+	-L/usr/lib32 -Wl,-rpath,/usr/lib32 \
+	-L${KAS_DIR}/lib -Wl,-rpath,${KAS_DIR}/lib \
+	-lgthread-2.0 -lglib-2.0 -lkassdk -lpthread
+
+TARGET = aspamd
+
+SRC = logging parser assassin pairs aspamd server \
+	session reactor kas
+
+OBJS = $(addprefix src/, $(addsuffix .o, $(SRC)))
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJS)
+	$(LD) $(LDFLAGS) $(OBJS) -o $(TARGET)
+
+all: $(TARGET)
+
+install:
+	cp -f $(TARGET) $(PREFIX)/sbin
+	cp -f aspamd.conf $(PREFIX)/etc
+
+clean:
+	rm -f $(OBJS) $(TARGET)

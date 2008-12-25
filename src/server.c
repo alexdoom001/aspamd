@@ -3,20 +3,101 @@
  *
  */
 
+#include <sys/signalfd.h>
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <glib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include "server.h"
-#include "errors.h"
-#include "session.h"
+#include <kas.h>
+#include <errors.h>
+#include <session.h>
+#include <server.h>
+#include <time.h>
+#include <config.h>
 
-#define ASPAMD_NET_POLL_FD	(ASPAMD_NET_MAX_CON + 1)
+static const gchar *default_server_ip = ASPAMD_DEFAULT_SERVER_IP,
+	*default_socket_path = ASPAMD_DEFAULT_SOCKET_PATH;
+
+/*-----------------------------------------------------------------------------*/
+
+static gint server_inet_socket (aspamd_server_t *server)
+{
+	gint ret = ASPAMD_ERR_OK;
+	struct sockaddr_in sock_addr;
+	int opt, err;
+
+	server->socket = socket (AF_INET, SOCK_STREAM, 0);
+	ASPAMD_ERR_IF (server->socket == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to create socket: %s",
+		       server, strerror (errno));
+	g_debug ("server %p: master socket %i is opened", server, server->socket);
+
+	opt = 1;
+	err = setsockopt(server->socket, SOL_SOCKET, SO_REUSEADDR,
+			 &opt, sizeof(opt));
+	ASPAMD_ERR_IF (err == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to set socket %i option: %s",
+		       server, server->socket, strerror (errno));
+
+	memset(&sock_addr, 0, sizeof(sock_addr));
+	sock_addr.sin_port = htons(server->port);
+	sock_addr.sin_family = AF_INET;
+	err = inet_aton (server->ip, &sock_addr.sin_addr);
+	ASPAMD_ERR_IF (err < 0, ASPAMD_ERR_NET,
+		       "server %p: failed to form socket %i addr from string `%s'",
+		       server, server->socket, server->ip);
+
+	err = bind(server->socket, (struct sockaddr *) &sock_addr,
+		   sizeof(sock_addr));
+	ASPAMD_ERR_IF (err == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to bind socket to %i:%s",
+		       server, server->socket, strerror (errno));
+	g_debug ("server %p: socket %i is bound to %s:%i",
+		 server, server->socket, server->ip, server->port);
+	server->type = ASPAMD_SERVER_INET;
+at_exit:
+	return ret;
+}
+
+static gint server_unix_socket (aspamd_server_t *server)
+{
+	gint ret = ASPAMD_ERR_OK;
+	struct sockaddr_un sock_addr;
+	int err;
+
+	server->socket = socket (AF_UNIX, SOCK_STREAM, 0);
+	ASPAMD_ERR_IF (server->socket == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to create socket: %s",
+		       server, strerror (errno));
+	g_debug ("server %p: master socket %i is opened", server, server->socket);
+
+	memset(&sock_addr, 0, sizeof(sock_addr));
+	sock_addr.sun_family = AF_UNIX;
+	strcpy(sock_addr.sun_path, server->sock_path);
+	unlink(server->sock_path);
+
+	err = bind(server->socket, (struct sockaddr *) &sock_addr,
+		   sizeof(sock_addr));
+	ASPAMD_ERR_IF (err == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to bind socket to %i: %s",
+		       server, server->socket, strerror (errno));
+	g_debug ("server %p: socket is bound to: %s",
+		 server, server->sock_path);
+	err = chmod (server->sock_path, S_IRWXU | S_IRWXG | S_IRWXO);
+	ASPAMD_ERR_IF (err == -1, ASPAMD_ERR_ERR,
+		       "server %p: failed to chmod the %s: %s",
+		       server, server->sock_path, strerror (errno));
+	server->type = ASPAMD_SERVER_UNIX;
+at_exit:
+	return ret;
+}
 
 /** @brief fcntl wrapper
  *
@@ -28,7 +109,7 @@
  * @return an error code
  */
 
-static gint aspamd_fcntl(int socket, int option)
+static gint server_fcntl(int socket, int option)
 {
 	int cur_options;
 
@@ -50,370 +131,387 @@ static gint aspamd_fcntl(int socket, int option)
 	return ASPAMD_ERR_OK;
 }
 
-/** @brief server idle handler
- *
- * launched when there are no active tasks at the moment to do some
- * real-time uncritical things like a garbage collection.
- *
- * @param server server data
- * @return an error code
- */
-
-static gint aspamd_server_idle (aspamd_server_t *server)
-{
-	g_assert (server);
-
-	return ASPAMD_ERR_OK;
-}
-
-/** @brief accepts new connection
- *
- * checks connection limit and accepts new connections. if there are
- * no free slots then server socket polling will be disabled until
- * some client sessions will not be terminated.
- *
- * @param server server data
- * @return an error code
- */
-
-static gint aspamd_server_accept (aspamd_server_t *server)
+static gint server_accept (aspamd_server_t *server, gint fd, aspamd_reactor_io_t *io)
 {
 	gint ret = ASPAMD_ERR_OK;
-	int i, sock;
-	struct pollfd *poll_fd = NULL,
-		*empty_poll_fd = NULL;
-	struct sockaddr_in remote_addr;
+	int sock;
+	struct sockaddr_in remote_addr_in;
+	struct sockaddr_un remote_addr_un;
 	socklen_t addr_size = sizeof (struct sockaddr_in);
-	aspamd_session_t *session;
+	aspamd_session_t *session = NULL;
 
-	poll_fd = &server->poll_fds[0];
+	g_assert (server && io);
 
-	if (poll_fd->revents & POLLERR)
+	if (io->events & POLLERR)
 	{
-		g_critical ("accept faild on socket %i", server->socket);
-		return ASPAMD_ERR_NET;
+		g_critical ("server %p: failed to accept connection on socket %i",
+			    server, server->socket);
+		aspamd_server_stop (server);
+		aspamd_server_start (server, server->type, server->stub, server->timeout);
+		goto at_exit;
 	}
 
-	/* if there are no free slots I have to disable server socket
-	 * polling */
-	if(server->num_fds == ASPAMD_NET_POLL_FD)
+	if (server->type == ASPAMD_SERVER_INET)
 	{
-		g_critical ("maximum number of clients is achieved, connection refused");
-		poll_fd->events = 0;
-		return ASPAMD_ERR_NET;
+		sock = accept (server->socket, (struct sockaddr *)&remote_addr_in,
+			       &addr_size);
+		g_assert (sock > 0);
+		g_debug ("server %p: accepted connection from %s:%i into socket %i",
+			 server, inet_ntoa (remote_addr_in.sin_addr),
+			 ntohs (remote_addr_in.sin_port), sock);
 	}
-
-	for (i = 1, empty_poll_fd = NULL; i < ASPAMD_NET_POLL_FD; i++)
+	else
 	{
-		empty_poll_fd = &server->poll_fds[i];
-		if (empty_poll_fd->fd == 0)
-			break;
+		sock = accept (server->socket, (struct sockaddr *)&remote_addr_un,
+			       &addr_size);
+		g_assert (sock > 0);
+		g_debug ("server %p: accepted connection into socket %i",
+			 server, sock);
 	}
-
-	g_assert (empty_poll_fd->fd == 0);
-
-	sock = accept (server->socket, (struct sockaddr *)&remote_addr,
-		       &addr_size);
-
-	g_assert (sock > 0);
-
-	g_debug ("connection from %s:%i accepted, socket: %i",
-		 inet_ntoa (remote_addr.sin_addr),
-		 ntohs (remote_addr.sin_port),
-		 sock);
-	ret = aspamd_fcntl (sock, O_NONBLOCK);
+	ret = server_fcntl (sock, O_NONBLOCK);
 	ASPAMD_ERR_CHECK (ret);
-	ret = aspamd_start_session (server, sock, &session);
+	ret = aspamd_session_allocate (&session, server, sock);
 	ASPAMD_ERR_CHECK (ret);
-	empty_poll_fd->fd = sock;
-	empty_poll_fd->events = POLLIN | POLLPRI | POLLERR;
-	empty_poll_fd->revents = 0;
-
-	/* tricky function, it differs same values placed in different
-	* memory regions */
-
-	g_hash_table_insert (server->sessions_by_fd, &empty_poll_fd->fd, session);
-
-	server->num_fds++;
-	poll_fd->revents = 0;
-at_exit:
-	return ret;
-}
-
-/*-----------------------------------------------------------------------------*/
-
-/** @brief initializes server and prepares one for start
- *
- * opens server socket, binds one, makes it unblocking. creates array
- * of poll structures and hash table to find out the opened sessions
- * quickly.
- *
- * @param server server data
- * @return an error code
- */
-
-gint aspamd_start_server (aspamd_server_t *server)
-{
-	gint ret = ASPAMD_ERR_OK;
-	struct sockaddr_in sock_addr;
-	int opt;
-
-	g_assert (server);
-
-	server->socket = socket (AF_INET, SOCK_STREAM, 0);
-	if (server->socket == -1)
-	{
-		g_critical ("failed to create socket: %s",
-			    strerror (errno));
-		ret = ASPAMD_ERR_NET;
-		goto at_exit;
-	}
-	g_debug ("socket opened: %i", server->socket);
-
-	opt = 1;
-	if (setsockopt(server->socket, SOL_SOCKET, SO_REUSEADDR,
-		       &opt, sizeof(opt)) == -1)
-	{
-		g_critical ("failed to set socket %i option: %s",
-			    server->socket, strerror (errno));
-		ret = ASPAMD_ERR_NET;
-		goto at_exit;
-	}
-
-	memset(&sock_addr, 0, sizeof(sock_addr));
-	sock_addr.sin_port = htons(server->port);
-	sock_addr.sin_family = AF_INET;
-	if(inet_aton (server->ip, &sock_addr.sin_addr) < 0)
-	{
-		g_critical ("failed to form socket %i addr from string %s",
-			    server->socket, server->ip);
-		ret = ASPAMD_ERR_NET;
-		goto at_exit;
-	}
-
-	if (bind(server->socket, (struct sockaddr *) &sock_addr,
-		 sizeof(sock_addr)) == -1)
-	{
-		g_critical ("failed to bind socket %i: %s",
-			    server->socket, strerror (errno));
-		ret = ASPAMD_ERR_NET;
-		goto at_exit;
-	}
-
-	if(listen(server->socket, 16))
-	{
-		g_critical ("failed to start listening on socket %i: %s",
-			    server->socket, strerror (errno));
-		ret = ASPAMD_ERR_NET;
-		goto at_exit;
-	}
-	g_debug ("socket %i bound to %s:%i",
-		 server->socket, server->ip, server->port);
-
-	aspamd_fcntl (server->socket, O_NONBLOCK);
+	ret = aspamd_session_start (session);
 	ASPAMD_ERR_CHECK (ret);
-
-	server->poll_fds = g_malloc0 (sizeof (struct pollfd) * ASPAMD_NET_POLL_FD); 
-	if (!server->poll_fds)
-	{
-		g_critical ("memory allocation failed");
-		ret = ASPAMD_ERR_MEM;
-		goto at_exit;
-	}
-
-	server->poll_fds[0].fd = server->socket;
-	server->poll_fds[0].events = POLLIN | POLLERR;
-	server->poll_fds[0].revents = 0;
-	server->num_fds = 1;
-
-	server->sessions_by_fd =  g_hash_table_new (g_int_hash, g_int_equal);
-	if (!server->sessions_by_fd)
-	{
-		g_critical ("memory allocation failed");
-		ret = ASPAMD_ERR_MEM;
-		goto at_exit;
-	}
-
-	server->running = 1;
-
+	g_mutex_lock (server->lock);
+	server->sessions = g_slist_append (server->sessions, session);
+	server->accepted ++;
+	g_mutex_unlock (server->lock);
 at_exit:
 	if (ret != ASPAMD_ERR_OK)
 	{
-		if (server->sessions_by_fd)
-		{
-			g_hash_table_destroy (server->sessions_by_fd);
-			server->sessions_by_fd = 0;
-		}
-		if (server->poll_fds)
-		{
-			g_free (server->poll_fds);
-			server->poll_fds = 0;
-		}
-		if (server->socket > 0)
-		{
-			close (server->socket);
-			server->socket = 0;
-		}
+		if (session)
+			aspamd_session_unref (session);
 	}
-	return ret;
+	return ASPAMD_REACTOR_OK;
 }
 
-/** @brief runs server 
- *
- * runs polling loop to handle socket events asynchronously. if there
- * is event on server socket then aspamd_server_accept is executed, if
- * there are no events at all (eg timeout occurs ) aspamd_server_idle
- * is executed. Otherwise session read call back is executed to handle
- * incoming data.
- *
- * @param server server data
- * @return an error code
- */
-
-gint aspamd_server_run (aspamd_server_t *server)
+static gint server_idle (aspamd_server_t *server, gint fd, gpointer stub)
 {
-	gint ret = ASPAMD_ERR_OK;
-	struct pollfd *curr_poll_fd = NULL;
-	int i, poll_ret;
-	aspamd_session_t *session;
+	GSList *iter = NULL;
+	g_assert (server);
+
+	g_mutex_lock (server->lock);
+	if (server->garbage)
+	{
+		g_debug ("server %p: starting garbage collection",
+			server);
+		for (iter = server->garbage; iter; iter = g_slist_next (iter))
+			aspamd_session_unref (iter->data);
+		g_slist_free (server->garbage);
+		server->garbage = NULL;
+	}
+	g_mutex_unlock (server->lock);
+	return ASPAMD_REACTOR_OK;
+}
+
+static void server_dump_stats (aspamd_server_t *server)
+{
+	gint sum = 0;
+	GSList *iter = NULL;
+	gint timestamp = 0;
 
 	g_assert (server);
 
-	g_debug ("server on socket %i is ready to run", server->socket);
+	timestamp = (gint)time (NULL);
 
-	for (;server->running;)
+	if (server->accepted)
 	{
-		poll_ret = poll(server->poll_fds, ASPAMD_NET_POLL_FD,
-				ASPAMD_NET_POLL_TIMEOUT);
-
-		if (poll_ret == -1)
-		{
-			if (errno == EINTR)
-				continue;
-			else
-			{
-				g_critical ("polling error on socket %i: %s",
-					    server->socket, strerror (errno));
-				ret = ASPAMD_ERR_NET;
-				goto at_exit;
-			}
-		}
-
-		if (poll_ret == 0)
-		{
-			ret = aspamd_server_idle (server);
-			ASPAMD_ERR_CHECK (ret);
-			continue;
-		}
-		
-		if (server->poll_fds[0].revents)
-		{
-			if(aspamd_server_accept (server) != ASPAMD_ERR_OK)
-				continue;
-		}
-
-		for (i = 1; i < ASPAMD_NET_POLL_FD; i++)
-		{
-			curr_poll_fd = &server->poll_fds[i];
-			if (curr_poll_fd->fd > 0 && curr_poll_fd->revents)
-			{
-				if (curr_poll_fd->revents & POLLERR)
-				{
-					g_critical ("socket %i error: %s",
-						    curr_poll_fd->fd,
-						    strerror (errno));
-					aspamd_server_close_session (server, session);
-					continue;
-				}
-				session = g_hash_table_lookup (server->sessions_by_fd,
-							       &curr_poll_fd->fd);
-				g_assert (session);
-				ret = aspamd_session_read_callback (session);
-				if (ret != ASPAMD_ERR_OK)
-					aspamd_server_close_session (server, session);
-				curr_poll_fd->revents = 0;
-			}
-		}
+		g_message ("statistic of %i minutes uptime",
+			   (timestamp - server->timestamp) / 60);
+		g_message ("connections accepted - %i", server->accepted);
 	}
 
-at_exit:
-	return ret;
+	if (server->bytes_read)
+	{
+		for (iter = server->bytes_read; iter; iter = g_slist_next (iter))
+			sum += (gint) iter->data;
+		g_message ("average request size - %i bytes",
+			 sum / g_slist_length (server->bytes_read));
+		g_message ("incoming data bitrate - %i KBit",
+			 8 * sum / ((timestamp - server->timestamp) * 1024));
+		g_slist_free (server->bytes_read);
+		server->bytes_read = NULL;
+	}
+
+	sum = 0;
+
+	if (server->bytes_written)
+	{
+		for (iter = server->bytes_written; iter; iter = g_slist_next (iter))
+			sum += (gint) iter->data;
+		g_message ("average reply size - %i bytes",
+			   sum / g_slist_length (server->bytes_written));
+		g_message ("outgoing data bitrate - %i KBit",
+			   8 * sum / ((timestamp - server->timestamp) * 1024));
+		g_slist_free (server->bytes_written);
+		server->bytes_written = NULL;
+	}
+	server->accepted = 0;
+	server->timestamp = timestamp;
 }
 
-/** @brief closes session
+
+/*-----------------------------------------------------------------------------*/
+
+aspamd_pair_t server_types[] = {
+	{ASPAMD_SERVER_INET, "INET"},
+	{ASPAMD_SERVER_UNIX, "UNIX"}
+};
+
+/** @brief allocates resources to run server
  *
- * removes session from polling list and executes aspamd_close_session
- * function to release allocated resources.
- *
- * @param server server data
- * @param session session to be closed
+ * @param new_server pointer to return allocated object
  * @return an error code
  */
 
-gint aspamd_server_close_session (aspamd_server_t *server, aspamd_session_t *session)
+gint aspamd_server_allocate (aspamd_server_t **new_server, aspamd_reactor_t *reactor,
+			     kas_data_t *kas)
 {
-	int i;
-	struct pollfd *curr_poll_fd = NULL;
+	gint ret = ASPAMD_ERR_OK;
+	aspamd_server_t *server = NULL;
 
+	g_assert (reactor);
+
+	server = g_slice_new (aspamd_server_t);
+	ASPAMD_ERR_IF (!server, ASPAMD_ERR_MEM,
+		       "network server allocation failed");
+	server->lock = g_mutex_new ();
+	ASPAMD_ERR_IF (!server->lock, ASPAMD_ERR_MEM,
+		       "server %p: mutex allocation failed", server);
+
+	server->port = ASPAMD_DEFAULT_SERVER_PORT;
+	server->ip = (gchar *) default_server_ip;
+	server->sock_path = (gchar *) default_socket_path;
+	server->socket = -1;
+	server->kas = kas;
+	server->sessions = NULL;
+	server->sessions_to_free = NULL;
+	server->garbage = NULL;
+	server->reactor = reactor;
+	server->timeout = ASPAMD_DEFAULT_TIMEOUT;
+	server->accepted = 0;
+	server->bytes_read = 0;
+	server->bytes_written = 0;
+
+	g_debug ("server at %p is allocated: ip - %s, port - %i, reactor - %p, kas - %p",
+		 server, server->ip, server->port, server->reactor, server->kas);
+
+at_exit:
+	if (ret == ASPAMD_ERR_OK)
+		*new_server = server;
+	else
+	{
+		*new_server = NULL;
+		if (server)
+			aspamd_server_free (server);
+	}
+	return ret;
+}
+
+/** @brief initializes server and prepares one for start
+ *
+ * opens server socket, binds one, makes it unblocking.
+ *
+ * @param server server data
+ * @return an error code
+ */
+
+gint aspamd_server_start (aspamd_server_t *server, gint type, gint stub, gint timeout)
+{
+	gint ret = ASPAMD_ERR_OK;
+	gint err;
+
+	g_assert (server);
+
+	g_mutex_lock (server->lock);
+	if (type == ASPAMD_SERVER_INET)
+		ret = server_inet_socket (server);
+	else if(type == ASPAMD_SERVER_UNIX)
+		ret = server_unix_socket (server);
+	else
+		ret = ASPAMD_ERR_PARAM;
+	ASPAMD_ERR_CHECK (ret);
+
+	err = listen(server->socket, 16);
+	ASPAMD_ERR_IF (err == -1, ASPAMD_ERR_NET,
+		       "server %p: failed to start socket %i listening: %s",
+		       server, server->socket, strerror (errno));
+
+	server_fcntl (server->socket, O_NONBLOCK);
+	ASPAMD_ERR_CHECK (ret);
+
+	ret = aspamd_reactor_add (server->reactor, server->socket, POLLIN | POLLERR,
+				  server);
+	ASPAMD_ERR_CHECK (ret);
+	ret = aspamd_reactor_on_io (server->reactor, server->socket,
+				    (aspamd_reactor_cbck_t)&server_accept, 0);
+	ASPAMD_ERR_CHECK (ret);
+	ret = aspamd_reactor_on_idle (server->reactor, server->socket,
+				      (aspamd_reactor_cbck_t)&server_idle, 0);
+	ASPAMD_ERR_CHECK (ret);
+
+	server->stub = stub;
+	server->timeout = timeout;
+	server->accepted = 0;
+	server->timestamp = (gint) time (NULL);
+	server->errors = 0;
+	server->bytes_written = NULL;
+	server->bytes_read = NULL;
+
+	g_debug ("server %p: is started, stub mode - %i", server, stub);
+
+at_exit:
+	g_mutex_unlock (server->lock);
+	return ret;
+}
+
+/** @brief detaches session
+ *
+ * @param server server data
+ * @param session session to be closed
+ */
+
+void aspamd_server_detach (aspamd_server_t *server, aspamd_session_t *session)
+{
 	g_assert (server && session);
 
-	for (i = 1; i < ASPAMD_NET_POLL_FD; i++)
+	g_mutex_lock (server->lock);
+	if (g_slist_find (server->sessions, session))
 	{
-		curr_poll_fd = &server->poll_fds[i];
-		if (curr_poll_fd->fd == session->socket)
-			break;
+		if (g_slist_length (server->bytes_read) < ASPAMD_STAT_ENTRIES &&
+		    g_slist_length (server->bytes_written) < ASPAMD_STAT_ENTRIES)
+		{
+			server->bytes_read = g_slist_append (
+				server->bytes_read,
+				(gpointer) session->bytes_read);
+			server->bytes_written = g_slist_append (
+				server->bytes_written,
+				(gpointer) session->bytes_written);
+		}
+		else
+		{
+			g_debug ("server %p: no place to store stats, forcing dump", server);
+			server_dump_stats (server);
+		}
+		server->sessions = g_slist_remove (server->sessions, session);
+		server->garbage = g_slist_append (server->garbage, session);
+		g_debug ("server %p: session %p is marked for removal",
+			 server, session);
 	}
-	g_assert (curr_poll_fd->fd == session->socket);
-	g_hash_table_remove (server->sessions_by_fd, &curr_poll_fd->fd);
-	curr_poll_fd->fd = 0;
-	curr_poll_fd->events = 0;
-	curr_poll_fd->revents = 0;
-	g_debug ("socket %i is removed from polling list", session->socket);
-	aspamd_close_session (session);
-	/* server socket polling is re-enabled if there are free slots
-	 * to handle connection */
-	if (server->num_fds < ASPAMD_NET_POLL_FD)
-		server->poll_fds[0].events = POLLIN;
-	server->num_fds--;
-	return ASPAMD_ERR_OK;
+	g_mutex_unlock (server->lock);
 }
 
 /** @brief stops server
  *
- * releases resources allocated by server, cleans-up polling list and
- * other internal structures, closes server socket.
+ * kills all running sessions and closes server socket
  *
  * @param server server data
  * @return an error code
  */
 
-void aspamd_stop_server (aspamd_server_t *server)
+gint aspamd_server_stop (aspamd_server_t *server)
 {
+	gint ret = ASPAMD_ERR_OK;
+	GSList	*iter = NULL;
+
 	g_assert (server);
 
-	gint foreach_lambda (gpointer key, gpointer value, gpointer user_data)
-	{
-		aspamd_close_session ((aspamd_session_t *)value);
-		return TRUE;
-	}
-
-	if (server->sessions_by_fd)
-	{
-		g_hash_table_foreach_remove (server->sessions_by_fd, foreach_lambda, NULL);
-		g_hash_table_destroy (server->sessions_by_fd);
-		server->sessions_by_fd = 0;
-	}
-
-	if (server->poll_fds)
-	{
-		g_free (server->poll_fds);
-		server->poll_fds = 0;
-	}
+	g_mutex_lock (server->lock);
 	if (server->socket > 0)
 	{
-		shutdown (server->socket, SHUT_RDWR);
-		g_debug ("socket %i is shut down", server->socket);
+		aspamd_reactor_remove (server->reactor, server->socket, server);
+		if(shutdown (server->socket, SHUT_RDWR) == -1)
+		{
+			g_warning ("server %p: failed to shutdown socket %i: %s", server,
+				   server->socket, strerror (errno));
+			ret = ASPAMD_ERR_NET;
+		}
+		else
+			g_debug ("server %p: socket %i is shut down", server, server->socket);
 		close (server->socket);
 		server->socket = 0;
 	}
+	if (server->type == ASPAMD_SERVER_UNIX)
+		unlink (server->sock_path);
+	if (server->sessions)
+	{
+		for (iter = server->sessions; iter; iter = g_slist_next (iter))
+		{
+			aspamd_session_stop (iter->data);
+			server->garbage = g_slist_append (server->garbage, iter->data);
+		}
+		g_slist_free (server->sessions);
+		server->sessions = NULL;
+	}
+	if (server->sessions_to_free)
+	{
+		for (iter = server->sessions_to_free; iter; iter = g_slist_next (iter))
+			session_free (iter->data);
+		g_slist_free (server->sessions_to_free);
+		server->sessions_to_free = NULL;
+	}
+	server_dump_stats (server);
+	g_mutex_unlock (server->lock);
+	return ret;
+}
+
+/** @brief releases resources allocated by server
+ *
+ * @param server server to be released
+ * @return an error code
+ */
+
+void aspamd_server_free (aspamd_server_t *server)
+{
+	GSList	*iter = NULL;
+
+	g_assert (server);
+
+	g_debug ("server at %p is about to be released", server);
+
+	if (server->ip && server->ip != default_server_ip)
+	{
+		g_free (server->ip);
+		server->ip = NULL;
+	}
+	
+	if (server->sock_path && server->sock_path != default_socket_path)
+	{
+		g_free (server->sock_path);
+		server->sock_path = NULL;
+	}
+
+	if (server->sessions)
+	{
+		for (iter = server->sessions; iter; iter = g_slist_next (iter))
+			aspamd_session_unref (iter->data);
+		g_slist_free (server->sessions);
+		server->sessions = NULL;
+	}
+
+	if (server->sessions_to_free)
+	{
+		for (iter = server->sessions_to_free; iter; iter = g_slist_next (iter))
+			session_free (iter->data);
+		g_slist_free (server->sessions_to_free);
+		server->sessions_to_free = NULL;
+	}
+
+	if (server->garbage)
+	{
+		for (iter = server->garbage; iter; iter = g_slist_next (iter))
+			aspamd_session_unref (iter->data);
+		g_slist_free (server->garbage);
+		server->garbage = NULL;
+	}
+
+	if (server->lock)
+	{
+		g_free (server->lock);
+		server->lock = NULL;
+	}
+
+	g_slice_free1 (sizeof (aspamd_server_t), server);
 }

@@ -42,7 +42,7 @@ enum assassin_prs_state
 
 gint assassin_parser_allocate (assassin_parser_t **new_parser, gint type, gint verbose);
 gint assassin_parser_scan (assassin_parser_t *parser, const gchar *buffer, gint *offset,
-			   gint size, gint *completed, gint auto_free);
+			   gint size, gint *completed, gint allocated);
 void assassin_parser_reset (assassin_parser_t *parser);
 assassin_message_t * assassin_parser_get (assassin_parser_t *parser);
 void assassin_parser_free (assassin_parser_t *parser);

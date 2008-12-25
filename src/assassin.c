@@ -3,133 +3,251 @@
  *
  */
 
+#include <string.h>
 #include <stdio.h>
 #include <glib.h>
-#include "assassin.h"
-#include "errors.h"
-#include "net.h"
+#include <assassin.h>
+#include <errors.h>
+#include <pairs.h>
+#include <config.h>
 
-static struct
+static gint assassin_print_header (assassin_header_t *header, gchar *buffer, gint *offset,
+				   gint size)
 {
-	gint code;
-	gchar *representation;
-} 
-code_to_str[] =
-{
-	{assassin_ex_ok, "EX_OK"},
-	{assassin_ex_usage, "EX_USAGE"},
-	{assassin_ex_dataerr, "EX_DATAERR"},
-	{assassin_ex_noinput, "EX_NOINPUT"},
-	{assassin_ex_nouser, "EX_NOUSER"},
-	{assassin_ex_nohost, "EX_NOHOST"},
-	{assassin_ex_unavailable, "EX_UNAVAILABLE"},
-	{assassin_ex_software, "EX_SOFTWARE"},
-	{assassin_ex_oserr, "EX_OSERR"},
-	{assassin_ex_osfile, "EX_OSFILE"},
-	{assassin_ex_cantcreat, "EX_CANTCREAT"},
-	{assassin_ex_ioerr, "EX_IOERR"},
-	{assassin_ex_tempfail, "EX_TEMPFAIL"},
-	{assassin_ex_protocol, "EX_PROTOCOL"},
-	{assassin_ex_noperm, "EX_NOPERM"},
-	{assassin_ex_config, "EX_CONFIG"},
-	{assassin_ex_timeout, "EX_TIMEOUT"}
-};
-
-static char *hdr_type_to_str[] =
-{
-	"content-length",
-	"spam",
-	"user",
-	"compress",
-	"class",
-	"remove",
-	"set",
-	"did_set",
-	"did_remove"
-};
-
-static char *command_to_str[] =
-{
-	"CHECK",
-	"SYMBOLS",
-	"REPORT",
-	"REPORT_IFSPAM",
-	"SKIP",
-	"PING",
-	"PROCESS",
-	"TELL",
-	"HEADERS"
-};
-
-static char *msg_type_to_str[] =
-{
-	"request",
-	"response",
-};
-
-static gint assassin_hdr_printf (assassin_header_t *header, gchar *buffer, gint size)
-{
-	gint bytes_written = 0;
+	gint ret = ASPAMD_ERR_OK;
+	gint bytes = 0;
 	/* for spam header decoding */
 	gboolean spam;
 	gint numerator, denominator;
 	gchar *str;
+	aspamd_pair_t *pair;
 
-	g_assert (header && buffer);
+	g_assert (header && buffer && offset);
 
-	if (header->type == assassin_hdr_content_length)
+	pair = code_to_str (assassin_hdrs, header->type);
+
+	switch (header->type)
 	{
-		bytes_written = snprintf (buffer, size, "%s: %i\r\n",
-					  hdr_type_to_str[header->type],
-					  g_variant_get_int32 (header->value));
-		g_assert (bytes_written);
-	}
-	else if (header->type == assassin_hdr_user)
-	{
-		bytes_written = snprintf (buffer, size, "%s: %s\r\n",
-					  hdr_type_to_str[header->type],
-					  g_variant_get_string (header->value, NULL));
-		g_assert (bytes_written);
-	}
-	else if (header->type == assassin_hdr_spam)
+	case  assassin_hdr_content_length:
+		bytes = g_snprintf (buffer, size, "%s: %i\r\n",
+				    pair->string,
+				    g_variant_get_int32 (header->value));
+		break;
+	case assassin_hdr_user:
+		bytes = snprintf (buffer, size, "%s: %s\r\n",
+				  pair->string,
+				  g_variant_get_string (header->value, NULL));
+		break;
+	case assassin_hdr_spam:
 	{
 		g_variant_get (header->value, "(bii)", &spam, &numerator, &denominator);
 		if (spam)
 			str = "true";
 		else
 			str = "false";
-		bytes_written = snprintf (buffer, size, "%s: %s ; %i / %i\r\n",
-					  hdr_type_to_str[header->type],
-					  str, numerator, denominator);
-		g_assert (bytes_written);
+		bytes = snprintf (buffer, size, "%s: %s ; %i / %i\r\n",
+				  pair->string,
+				  str, numerator, denominator);
+		break;
+	}
+	case assassin_hdr_quarantine:
+	{
+		if (g_variant_get_boolean (header->value))
+			str = "true";
+		else
+			str = "false";
+		bytes = snprintf (buffer, size, "%s: %s\r\n", pair->string, str);
+		break;
+	}
+	default:
+		ASPAMD_ERR (ASPAMD_ERR_MSG, "header %s is not supported", pair->string);
+	}
+	if (bytes < size - 1)
+		*offset = bytes;
+at_exit:
+	return ret;
+}
+
+static gint assassin_print_head (assassin_message_t *message, gchar *buffer, gint *offset,
+				 gint size)
+{
+	gint ret = ASPAMD_ERR_OK;
+	GSList *iter = message->headers;
+	gint bytes = 0;
+	const gchar *error_str = NULL;
+	gchar *ptr = buffer;
+	assassin_header_t *header = NULL;
+	aspamd_pair_t *pair = NULL;
+
+	g_assert (message && buffer && offset);
+
+	if (message->type == assassin_msg_reply)
+	{
+
+		if (message->command != assassin_cmd_ping || message->error != assassin_ex_ok)
+		{
+			pair = code_to_str (assassin_errs, message->error);
+			error_str = pair->string;
+		}
+		else
+			error_str = "PONG";
+
+		bytes = g_snprintf (ptr, size, "SPAMD/%i.%i %i %s\r\n",
+				    message->version_major, message->version_minor,
+				    message->error, error_str);
+	}
+	else if (message->type == assassin_msg_request)
+	{
+		pair = code_to_str (assassin_cmds, message->command);
+		bytes = g_snprintf (ptr, size, "%s %s/%i.%i\r\n", pair->string,
+				    message->ident, message->version_major,
+				    message->version_minor);
+	}
+	else
+		ASPAMD_ERR (ASPAMD_ERR_MSG, 
+			    "message %p: unknown message type - %i", message, message->type);
+	
+
+	if (bytes < size - 1)
+	{
+		ptr += bytes;
+		size -= bytes;
+	}
+	else
+		ASPAMD_ERR (ASPAMD_ERR_MSG,
+			    "message %p: failed to write first line of the message header",
+			    message);		
+
+	for (iter = message->headers; iter; iter = g_slist_next (iter))
+	{
+		header = (assassin_header_t*) iter->data;
+		ret = assassin_print_header(header, ptr, &bytes, size);
+		
+		if (ret == ASPAMD_ERR_OK)
+		{
+			ptr += bytes;
+			size -= bytes;
+		}
+		else
+		{
+			pair = code_to_str (assassin_hdrs, header->type);
+			ASPAMD_ERR (ASPAMD_ERR_ERR,"message %p: failed to write header: `%s'",
+				    message, pair->string);
+		}
+	}	
+
+at_exit:
+	if (ret == ASPAMD_ERR_OK)
+		*offset = (glong) ptr - (glong) buffer;
+	return ret;
+}
+
+static gint assassin_print_body (assassin_message_t *message, gchar *buffer, gint *offset,
+				 gint size)
+{
+	gint ret = ASPAMD_ERR_OK;
+	gint body_size, bytes;
+	gchar *body = NULL;
+
+	if (message->content)
+	{
+		assassin_buffer_get_data (message->content, (gpointer *)&body, &body_size);
+		body_size += 3; /* \r\n + \0 */
 	}
 	else
 	{
-		g_warning ("header %s is not supported",
-			   hdr_type_to_str[header->type]);
+		body_size = 3; /* \r\n + \0 */
+		body = "";
 	}
-	return bytes_written;
+	ASPAMD_ERR_IF (body_size > size, ASPAMD_ERR_MSG,
+		       "message %p: body does not fit the buffer", message);
+	bytes = g_snprintf (buffer, body_size, "\r\n%s", body);
+	*offset = bytes;
+
+at_exit:
+	return ret;
 }
 
-/** @brief provides string representation of SpamAssassin error code
+/*-----------------------------------------------------------------------------*/
+
+gint assassin_buffer_allocate (assassin_buffer_t **new_buffer, int size)
+{
+	gint ret = ASPAMD_ERR_OK;
+	assassin_buffer_t *buffer= NULL;
+
+	buffer = g_slice_new (assassin_buffer_t);
+	ASPAMD_ERR_IF (!buffer, ASPAMD_ERR_MEM, "failed to allocate new buffer");
+	buffer->allocated = 1;
+	if (size > 0)
+	{
+		buffer->data = g_malloc (size);
+		ASPAMD_ERR_IF (!buffer->data, ASPAMD_ERR_MEM,
+			       "failed to allocate new buffer");
+		buffer->size = size;
+		buffer->offset = 0;
+	}
+	else
+	{
+		buffer->data = NULL;
+		buffer->size = 0;
+		buffer->offset = 0;
+	}
+	g_debug ("new buffer at %p is allocated, data - %p, offset - %i, size %i", 
+		 buffer, buffer->data, buffer->offset, buffer->size);
+at_exit:
+	if (ret == ASPAMD_ERR_OK)
+		*new_buffer = buffer;
+	else
+	{
+		*new_buffer = NULL;
+		assassin_buffer_free (buffer);
+	}
+		
+	return ret;
+}
+
+/** @brief extracts actual data beginning and size
  *
- * @param error an error code, take a look at #assassin_error for
- * details.
- * @return pointer to string or NULL
+ * @param buffer a buffer
+ * @param data pointer to return data location
+ * @param size pointer to return data size
  */
 
-static gchar *assassin_error_to_string (gint error)
+void assassin_buffer_get_data (assassin_buffer_t *buffer, gpointer *data, gint *size)
 {
-	int i;
+	g_assert (buffer && data && size);
 
-	for (i = 0; i < sizeof (code_to_str)/sizeof (code_to_str[0]); i++)
+	if (buffer->data)
 	{
-		if (code_to_str[i].code == error)
-			return code_to_str[i].representation;
+		*data = buffer->data + buffer->offset;
+		*size = buffer->size - buffer->offset;
 	}
-	return NULL;
+	else
+	{
+		*data = NULL;
+		*size = 0;
+	}
 }
 
+/** @brief releases a buffer
+ *
+ * if buffer is marked as free internal data will be released too.
+ *
+ * @param buffer a buffer
+ */
+
+void assassin_buffer_free (assassin_buffer_t *buffer)
+{
+	g_assert (buffer);
+
+	g_debug ("buffer %p is about to be released", buffer);
+	if (buffer->allocated)
+	{
+		g_free (buffer->data);
+		buffer->data = NULL;
+	}
+	g_slice_free1 (sizeof (assassin_buffer_t), buffer);
+}
 
 /*-----------------------------------------------------------------------------*/
 
@@ -146,27 +264,33 @@ static gchar *assassin_error_to_string (gint error)
  * @return #ASPAMD_ERR_OK or #ASPAMD_ERR_MEM
  */
 
-gint assassin_msg_allocate (assassin_message_t **new_message, gint type, gint command,
-			    gint major, gint minor)
+gint assassin_msg_allocate (assassin_message_t **new_message, gint type, const gchar *ident)
 {
 	gint ret = ASPAMD_ERR_OK;
 	assassin_message_t *message = NULL;
-	gchar *cmd = NULL;
+	aspamd_pair_t *pair = NULL;
 
 	message = g_slice_new (assassin_message_t);
-	if (!message)
-	{
-		g_critical ("memory allocation failed");
-		ret = ASPAMD_ERR_MEM;
-		goto at_exit;
-	}
+	ASPAMD_ERR_IF (!message, ASPAMD_ERR_MEM,
+		       "assassin message allocation failed");
 	message->type = type;
-	message->command = command;
-	message->version_major = major;
-	message->version_minor = minor;
-	message->content.buffer = NULL;
-	message->content.auto_free = 0;
+	message->command = -1;
+	message->version_major = ASSASSIN_VER_MAJOR;
+	message->version_minor = ASSASSIN_VER_MINOR;
 	message->headers = NULL;
+	message->content = NULL;
+	message->recipients = NULL;
+	if (ident)
+		message->ident = g_strdup (ident);
+	else
+	{
+		if (type == assassin_msg_request)
+			message->ident = g_strdup ("SPAMC");
+		else if (type == assassin_msg_reply)
+			message->ident = g_strdup ("SPAMD");
+		else
+			message->ident = NULL;
+	}
 
 at_exit:
 	if (ret == ASPAMD_ERR_OK)
@@ -176,12 +300,9 @@ at_exit:
 		*new_message = NULL;
 		assassin_msg_free (message);
 	}
-	if (command > 0)
-		cmd = command_to_str[command];
-	else
-		cmd = "empty";
-	g_debug ("new message %p, type - %s, command - %s", message, msg_type_to_str[type],
-		 cmd);
+	pair = code_to_str (assassin_msgs, type);
+	g_debug ("message at %p is allocated: type - %s, ident - %s",
+		 message, pair->string, message->ident);
 		
 	return ret;
 }
@@ -200,30 +321,33 @@ gint assassin_msg_add_header(assassin_message_t *message, gint type,
 			     GVariant *value)
 {
 	assassin_header_t *header;
+	aspamd_pair_t *pair = NULL;
 
 	g_assert (message && value);
+
+	pair = code_to_str (assassin_hdrs, type);
 
 	if (message->headers)
 	{
 		if (assassin_msg_find_header (message, type))		
 		{
-			g_warning ("header `%s' is already added to the message %p",
-				   hdr_type_to_str[type], message);
+			g_warning ("message %p: header `%s' is already added",
+				   message, pair->string);
 			return ASPAMD_ERR_MSG;
 		}
 	}
 	header = g_slice_new(assassin_header_t);
 	if (!header)
 	{
-		g_critical ("memory allocation failed");
+		g_critical ("header allocation failed");
 		return ASPAMD_ERR_MEM;
 	}
 	header->type = type;
 	header->value = value;
 	message->headers = g_slist_append (message->headers, header);
 	g_assert (message->headers);
-	g_debug ("header `%s' is added to the message %p", hdr_type_to_str[type],
-		 message);
+	g_debug ("message %p: header `%s' is added",
+		 message, pair->string);
 	
 	return ASPAMD_ERR_OK;
 }
@@ -259,23 +383,45 @@ GVariant *assassin_msg_find_header(assassin_message_t *message, gint type)
  * @param message a message
  * @param buffer buffer that contains body
  * @param offset offset in the buffer
- * @param auto_free call g_free to release buffer during destructor
+ * @param allocated call g_free to release buffer during destructor
  * @return #ASPAMD_ERR_OK, #ASPAMD_ERR_MSG if body is already attached
  */
 
 gint assassin_msg_add_body(assassin_message_t *message, gpointer buffer, gint offset,
-			   gint size, gint auto_free)
+			   gint size, gint allocated)
 {
-	if (message->content.buffer)
+	gint ret = ASPAMD_ERR_OK;
+
+	g_assert (message && buffer);
+
+	if (message->content)
 	{
-		g_critical ("body is already attached to the message %p", message);
-		return ASPAMD_ERR_MSG;
+		assassin_buffer_free (message->content);
+		message->content = NULL;
 	}
-	message->content.buffer = buffer;
-	message->content.offset = offset;
-	message->content.size = size;
-	message->content.auto_free = auto_free;
-	g_debug ("body of %i bytes is added to the message %p", size, message);
+	ret = assassin_buffer_allocate (&message->content, 0);
+	ASPAMD_ERR_CHECK (ret);
+	message->content->data = buffer;
+	message->content->offset = offset;
+	message->content->size = size;
+	message->content->allocated = allocated;
+	ret = assassin_msg_add_header (message, assassin_hdr_content_length,
+				       g_variant_new_int32 (size));
+	ASPAMD_ERR_CHECK (ret);
+	g_debug ("message %p: body of %i bytes is attached", message, size);
+at_exit:
+	return ret;
+}
+
+gint assassin_msg_set_body(assassin_message_t *message, assassin_buffer_t *buffer)
+{
+	if (message->content)
+	{
+		assassin_buffer_free (message->content);
+		message->content = NULL;
+	}
+	message->content = buffer;
+	g_debug ("message %p: body of %i bytes is attached", message, buffer->size);
 	return ASPAMD_ERR_OK;
 }
 
@@ -288,104 +434,74 @@ gint assassin_msg_add_body(assassin_message_t *message, gpointer buffer, gint of
  * free space in the buffer.
  */
 
-gint assassin_msg_printf (assassin_message_t *message, gpointer *data, gint *filling)
+gint assassin_msg_print (assassin_message_t *message, assassin_buffer_t **content,
+			 gint mode)
+
 {
 	gint ret = ASPAMD_ERR_OK;
-	gint size, bytes_written;
-	gchar *buffer = NULL, *offset = NULL;
-	GSList *iter = message->headers;
-	assassin_header_t *header;
-	gchar *body = NULL;
-	gint body_size;
-	gchar *error_str = NULL;
+	assassin_buffer_t *buffer = NULL;
+	gchar *head_buffer = NULL, *buf = NULL;
+	gint offset = 0, size = 0;
 
-	g_assert (message && data && filling);
-
-	if (message->type == assassin_msg_request)
+	if (mode == ASSASSIN_BUF_NEW)
 	{
-		g_critical ("SpamAssassin request serialization is not supported");
-		ret = ASPAMD_ERR_MSG;
-		goto at_exit;
+		size = g_variant_get_int32(
+			assassin_msg_find_header (message, assassin_hdr_content_length)) +
+			ASSASSIN_MAX_HEAD_SIZE;
+		ret = assassin_buffer_allocate (&buffer, size);
+		ASPAMD_ERR_CHECK (ret);
+		buf = buffer->data;
+		ret = assassin_print_head (message, buf, &offset, size);
+		ASPAMD_ERR_CHECK (ret);
+		buf += offset;
+		size -= offset;
+		ret = assassin_print_body (message, buf, &offset, size);
+		ASPAMD_ERR_CHECK (ret);
+		size -= offset;
+		buffer->size -= size;
 	}
-
-	size =  g_variant_get_int32(assassin_msg_find_header (
-					    message, assassin_hdr_content_length)) +
-		ASSASSIN_MAX_HEAD_SIZE;
-
-	offset = buffer = g_malloc (size);
-	if (!buffer)
+	else if (mode == ASSASSIN_BUF_CONTENT)
 	{
-		g_critical ("memory allocation failed");
-		ret = ASPAMD_ERR_MEM;
-		goto at_exit;
-	}
-
-	if (message->command != assassin_cmd_ping || message->error != assassin_ex_ok)
-		error_str = assassin_error_to_string (message->error);
-	else
-		error_str = "PONG";
-
-	bytes_written = snprintf (offset, size,
-				  "SPAMD/%i.%i %i %s\r\n",
-				  message->version_major, message->version_minor,
-				  message->error, error_str);
-
-	g_assert (bytes_written > 0);
-	offset += bytes_written;
-	size -= bytes_written;
-
-	for (iter = message->headers;
-	     iter;
-	     iter = g_slist_next (iter))
-	{
-		header = (assassin_header_t*)iter->data;
-		bytes_written = assassin_hdr_printf(header, offset, size);
-		g_assert (bytes_written > 0);
-		if (bytes_written > size)
+		if (message->content->allocated)
 		{
-			g_critical ("buffer size is exceeded");
-			ret = ASPAMD_ERR_MSG;
-			goto at_exit;
+			ret = assassin_buffer_allocate (&buffer, 0);
+			ASPAMD_ERR_CHECK (ret);
+			*buffer = *message->content;
+			buffer->allocated = 0;
 		}
-		offset += bytes_written;
-		size -= bytes_written;
-	}
+		else
+			buffer = message->content;
 
-	body_size = 3;
-	if (message->content.buffer)
-	{
-		body = (gchar *) message->content.buffer + message->content.offset;
-		body_size += message->content.size;
+		head_buffer = g_malloc (ASSASSIN_MAX_HEAD_SIZE);
+		ASPAMD_ERR_IF (!head_buffer, ASPAMD_ERR_MEM,
+			       "message %p: failed to allocated new buffer",
+			       message);
+		ret = assassin_print_head (message, head_buffer, &size,
+					   ASSASSIN_MAX_HEAD_SIZE);
+		ASPAMD_ERR_CHECK (ret);
+		ASPAMD_ERR_IF (size + 2 > buffer->offset, ASPAMD_ERR_MSG,
+			       "message %p: message head does not fit the buffer",
+			       message);
+		sprintf (head_buffer + size, "\r\n");
+		size += 2;
+		buffer->offset -= size;
+		buffer->size += size;
+		memcpy (buffer->data + buffer->offset, head_buffer, size);
 	}
-	else
-		body = "";
-
-	/* I should take into account '\0' character or message body
-	 * will be truncated */
-	bytes_written = snprintf (offset, MIN(size, body_size),
-				  "\r\n%s", body);
-	g_assert (bytes_written > 0);
-	if (bytes_written > size)
-	{
-		g_critical ("buffer size is exceeded");
-		ret = ASPAMD_ERR_MSG;
-		goto at_exit;
-	}
-	offset += bytes_written;
-	size -= bytes_written;
 
 at_exit:
+	if (head_buffer)
+		g_free (head_buffer);
 	if (ret == ASPAMD_ERR_OK)
-	{
-		*data = buffer;
-		*filling = offset - buffer;
-	}
+		*content = buffer;
 	else
 	{
-		*data = NULL;
-		*filling = 0;
+		*content = NULL;
 		if (buffer)
-			g_free (buffer);
+		{
+			assassin_buffer_free (buffer);
+			buffer = NULL;
+		}
 	}
 	return ret;
 }
@@ -399,10 +515,11 @@ at_exit:
 
 void assassin_msg_free (assassin_message_t *message)
 {
-	GSList *iter = message->headers;
+	GSList *iter;
 	assassin_header_t *header;
 
-	g_assert (message);
+	if (!message)
+		return;
 
 	g_debug ("message %p is about to be released", message);
 
@@ -419,14 +536,12 @@ void assassin_msg_free (assassin_message_t *message)
 		}
 		g_slist_free (message->headers);
 	}
-	if (message->type == assassin_msg_request)
-	{
-		if (message->client)
-			g_free (message->client);
-	}
-	if (message->content.auto_free && message->content.buffer)
-		g_free (message->content.buffer);
+	if (message->ident)
+		g_free (message->ident);
+	if (message->recipients)
+		g_free (message->recipients);
+	if (message->content)
+		assassin_buffer_free (message->content);
 
 	g_slice_free1 (sizeof (assassin_message_t), message);
 }
-

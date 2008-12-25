@@ -1,0 +1,11 @@
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: KAS
+Description: Kaspersky Anti Spam Engine
+Version: 4.1.0.23
+Libs: -L${libdir}/kas -lkas -lengine_loader-4-4.x -lpthread
+Libs.private: 
+Cflags: -I${includedir}/kas

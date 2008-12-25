@@ -1,0 +1,36 @@
+CC = gcc
+LD = gcc
+
+ifndef KAS_DIR
+KAS_DIR =  ../KAS_SDK5
+endif
+
+CFLAGS += -O2 -g \
+	-I $(KAS_DIR)/include -Isrc -DG_LOG_DOMAIN=\"aspamd\" \
+	-I.
+
+LDFLAGS += -g \
+	-L$(KAS_DIR)/lib -Wl,-rpath,$(KAS_DIR)/lib \
+	-lgthread-2.0 -lglib-2.0 -lkassdk -lpthread
+
+TARGET = aspamd
+
+SRC = logging parser assassin pairs aspamd server \
+	session reactor kas
+
+OBJS = $(addprefix src/, $(addsuffix .o, $(SRC)))
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJS)
+	$(LD) $(LDFLAGS) $(OBJS) -o $(TARGET)
+
+all: $(TARGET)
+
+install:
+	cp -f $(TARGET) $(PREFIX)/sbin
+	cp -f aspamd.conf $(PREFIX)/etc
+
+clean:
+	rm -f $(OBJS) $(TARGET)

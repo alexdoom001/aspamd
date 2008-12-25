@@ -9,7 +9,8 @@
 #ifndef _ASPAMD_ASSASSIN_
 #define _ASPAMD_ASSASSIN_
 
-#define ASSASSIN_MAX_HEAD_SIZE		(256)
+#define ASSASSIN_VER_MAJOR		1
+#define ASSASSIN_VER_MINOR		4
 
 /** assassin error codes. it is mostly ripped of Spamd.pm for
  * compatibility reasons. May be reused partly. */
@@ -99,7 +100,12 @@ enum assassin_header_type
 	assassin_hdr_remove,
 	assassin_hdr_set,
 	assassin_hdr_did_set,
-	assassin_hdr_did_remove
+	assassin_hdr_did_remove,
+	assassin_hdr_client_address,
+	assassin_hdr_helo_name,
+	assassin_hdr_mail_from,
+	assassin_hdr_rcpt_to,
+	assassin_hdr_quarantine
 };
 
 typedef enum assassin_header_type assassin_header_type_t;
@@ -122,11 +128,29 @@ enum assassin_message_type
 {
 	assassin_msg_request,
 	/*!< request produced by client */
-	assassin_msg_response
+	assassin_msg_reply
 	/*!< request formed by server*/
 };
 
 typedef enum assassin_message_type assassin_message_type_t;
+
+struct assassin_buffer
+{
+	gchar *data;
+	/*!< pointer to the data */
+	gint offset;
+	/*!< offset where data is placed */
+	gint size;
+	/*!< total buffer size */
+	gboolean allocated;
+	/*!< if not zero then call g_free to release buffer */
+};
+
+typedef struct assassin_buffer assassin_buffer_t;
+
+gint assassin_buffer_allocate (assassin_buffer_t **new_buffer, int size);
+void assassin_buffer_get_data (assassin_buffer_t *buffer, gpointer *data, gint *size);
+void assassin_buffer_free (assassin_buffer_t *buffer);
 
 struct assassin_message
 {
@@ -137,40 +161,35 @@ struct assassin_message
 	/*!< major version of the supported protocol */
 		version_minor,
 	/*!< minor version of the supported protocol */
-		command;
+		command,
 	/*!< command, take a look at #assassin_command to find out
 	 * possible values*/
-	union {
-		gint error;
-		/*!< error code, valid only for response */
-		gchar *client;
-		/*!< client identifier */
-	};
+		error;
+	/*!< error code, valid only for response */	
+	gchar *ident;
+	/*!< software type identifier */
 	GSList *headers;
 	/*!< single linked header list of #assassin_header
 	 * structures */
-	struct
-	{
-		gpointer buffer;
-		/*!< buffer that contains body of the message */
-		gint offset;
-		/*!< body offset in the content_buffer */
-		gint size;
-		/*!< body size */
-		gboolean auto_free;
-		/*!< if it is on then call g_free to release content_buffer */
-	}content;
+	const gchar **recipients;
+	assassin_buffer_t *content;
+};
+
+enum {
+	ASSASSIN_BUF_NEW,
+	ASSASSIN_BUF_CONTENT
 };
 
 typedef struct assassin_message assassin_message_t;
 
-gint assassin_msg_allocate (assassin_message_t **new_message, gint type, gint command,
-			    gint major, gint minor);
+gint assassin_msg_allocate (assassin_message_t **new_message, gint type, const gchar *ident);
 gint assassin_msg_add_header(assassin_message_t *message, gint type, GVariant *value);
 GVariant *assassin_msg_find_header(assassin_message_t *message, gint type);
 gint assassin_msg_add_body(assassin_message_t *message, gpointer buffer, gint offset,
-			   gint size, gint auto_free);
-gint assassin_msg_printf (assassin_message_t *message, gpointer *data, gint *filling);
+			   gint size, gint allocated);
+gint assassin_msg_set_body(assassin_message_t *message, assassin_buffer_t *buffer);
+gint assassin_msg_print (assassin_message_t *message, assassin_buffer_t **content,
+			 gint mode);
 void assassin_msg_free (assassin_message_t *message);
 
 #endif

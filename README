@@ -1,7 +1,14 @@
-Example of standalone spam daemon with KAS engine.
+Example of standalone spam daemon with two spam engines:
+	KAS engine and spamassasin.
+
 
 README
 -----------
 * to generate 'configure' script 'autoreconf --force --install'
 * to make debug build: './configure CFLAGS="-g3 -O0 -Wall"'
+* to make debug build: './configure --enable-debug-mode
+* to use Makefile.ia32 on Debian Squeeze:
+  sudo apt-get install ia32-libs-gtk
+  cd /lib32 ; ln -s libglib-2.0.so.0.2400.2 libglib-2.0.so
+  cd /usr/lib32 ; ln -s libgthread-2.0.so.0.2400.2 libgthread-2.0.so
 
