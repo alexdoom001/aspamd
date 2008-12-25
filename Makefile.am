@@ -1,5 +1,10 @@
-bin_PROGRAMS = aspamd
-aspamd_SOURCES = src/aspamd.c
+bin_PROGRAMS = aspamd parser_test
 
-aspamd_CFLAGS = $(DEPS_CFLAGS)
-aspamd_LIBS = $(DEPS_LIBS)
+aspamd_SOURCES = src/aspamd.c src/logging.c src/server.c src/session.c\
+	src/parser.c src/assassin.c
+aspamd_CFLAGS = $(GLIB_CFLAGS) -Isrc -DG_LOG_DOMAIN=\"aspamd\"
+aspamd_LDFLAGS = $(GLIB_LIBS)
+
+parser_test_SOURCES = src/parser.c src/assassin.c tests/parser_test.c src/logging.c
+parser_test_CFLAGS = $(GLIB_CFLAGS) -Isrc -DG_LOG_DOMAIN=\"parser_test\"
+parser_test_LDFLAGS = $(GLIB_LIBS)
