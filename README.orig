@@ -1,7 +1,0 @@
-Example of standalone spam daemon with KAS engine.
-
-README
------------
-* to generate 'configure' script 'autoreconf --force --install'
-* to make debug build: './configure CFLAGS="-g3 -O0 -Wall"'
-
