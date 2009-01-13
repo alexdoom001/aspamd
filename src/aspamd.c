@@ -307,7 +307,6 @@ gint aspamd_load_config (aspamd_context_t *context)
 		{
 			context->log->file_overwrite = int_value;
 			g_message ("logger file overwrite mode is set to: %i", int_value);
-			int_value = 0;
 		}
 	}
 	if (context->log->type == aspamd_log_file ||
@@ -435,7 +434,6 @@ gint aspamd_load_config (aspamd_context_t *context)
 				g_message ("network port is set to: %i",
 					   context->server->port);
 			}
-			int_value = 0;
 		}
 	}
 	else 

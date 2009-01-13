@@ -169,7 +169,7 @@ static gint aspamd_kas_check_settings(kas_data_t *kas)
 		g_debug ("kas %p: binary formats parsing is disabled", kas);
 
 	if (kas->use_uds)
-		kas->check_settings.checkFlags |= KASSDK_USE_UDS;
+		kas->check_settings.checkFlags |= KASSDK_USE_UDS1 | KASSDK_USE_UDS2;
 			/* enables using real time Urgent Detection
 			 * System (UDS) requests */
 
@@ -291,8 +291,8 @@ gint aspamd_kas_initialize (kas_data_t *kas)
 	init.operationOptions.scannerOptions.queueLength = kas->queue_size;
 	init.operationOptions.scannerOptions.threadCount = kas->threads_count;
 	init.operationOptions.scannerOptions.utf8Mode = 1;
-	init.operationOptions.networkTimeouts.timeoutDNS = 10;
-	init.operationOptions.networkTimeouts.timeoutUDS = 10;
+	init.operationOptions.networkTimeouts.timeoutDNS_ms = 10^4;
+	init.operationOptions.networkTimeouts.timeoutUDS_ms = 10^4;
 	init.loggingOptions.loggingLevel = KasSdkLoggingMinimum;
 
 	if (kas->filtering.enable) {

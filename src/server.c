@@ -509,7 +509,7 @@ void aspamd_server_free (aspamd_server_t *server)
 
 	if (server->lock)
 	{
-		g_free (server->lock);
+		g_mutex_free (server->lock);
 		server->lock = NULL;
 	}
 

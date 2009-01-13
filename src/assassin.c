@@ -72,7 +72,7 @@ static gint assassin_print_head (assassin_message_t *message, gchar *buffer, gin
 				 gint size)
 {
 	gint ret = ASPAMD_ERR_OK;
-	GSList *iter = message->headers;
+	GSList *iter;
 	gint bytes = 0;
 	const gchar *error_str = NULL;
 	gchar *ptr = buffer;
@@ -292,6 +292,10 @@ gint assassin_msg_allocate (assassin_message_t **new_message, gint type, const g
 			message->ident = NULL;
 	}
 
+	pair = code_to_str (assassin_msgs, type);
+	g_debug ("message at %p is allocated: type - %s, ident - %s",
+		 message, pair->string, message->ident);
+
 at_exit:
 	if (ret == ASPAMD_ERR_OK)
 		*new_message = message;
@@ -300,9 +304,6 @@ at_exit:
 		*new_message = NULL;
 		assassin_msg_free (message);
 	}
-	pair = code_to_str (assassin_msgs, type);
-	g_debug ("message at %p is allocated: type - %s, ident - %s",
-		 message, pair->string, message->ident);
 		
 	return ret;
 }

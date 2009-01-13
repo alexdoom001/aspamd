@@ -23,25 +23,27 @@
 #include <spamd_test.h>
 #include <spam_samples.h>
 #include <config.h>
+#include <pthread.h>
+
+#define MAX_THREAD_NUM 16
 
 aspamd_log_data_t logger;
 
 const gchar *default_server_ip = TEST_DEFAULT_IP,
 	*default_sock_path =TEST_DEFAULT_SOCK_PATH;
 
-gchar *server_ip = NULL,
-	*sock_path = NULL;
+gchar *server_ip = NULL, *sock_path = NULL, *msg_dir = NULL;
 
 gint	server_port = TEST_DEFAULT_PORT,
 	client_rate = TEST_CLNT_RATE_SLOW,
 	client_manner = TEST_CLNT_CLEVER,
-	running = 0;
+	running = 0, iteration = 0, threads = 1;
 
 assassin_parser_t *parser = NULL;
 
 gchar buffer[TEST_BUFFER_SIZE];
 gint buffer_filling;
-struct stat
+struct test_stats
 {
 	gint pings, msgs, err_msgs, refused;
 }stats;
@@ -71,6 +73,15 @@ gint parse_com_line (int argc, char *argv[])
 			{ "unix", 'u', 0, G_OPTION_ARG_STRING,
 			  &sock_path,
 			  "UNIX socket path", NULL},
+			{ "msg-dir", 'd', 0, G_OPTION_ARG_STRING,
+			  &msg_dir,
+			  "Message directory", NULL},
+			{ "threads", 't', 0, G_OPTION_ARG_INT,
+			  &threads,
+			  "Iteration number", NULL},
+			{ "number", 'n', 0, G_OPTION_ARG_INT,
+			  &iteration,
+			  "Iteration number", NULL},
 			{ NULL }
 		};
 
@@ -196,11 +207,24 @@ at_exit:
 	return ret;
 }
 
+static const char msg_hdr[] = "CHECK SPAMC/1.4\r\ncontent-length: ";
+
 gint write_request (gint sock, sample_message_t *sample)
 {
-	gint ret = ASPAMD_ERR_OK, bytes; 
+	gint ret = ASPAMD_ERR_OK, bytes;
+	char str[128];
 
-	bytes = write (sock, sample->body, strlen (sample->body));
+	if (sample->type == message_user) {
+		sprintf(str, "%s%d\r\n\r\n", msg_hdr, sizeof(msg_hdr));
+		bytes = write (sock, str, strlen(str));
+		if (bytes != strlen(str)) {
+			g_critical ("write failed: %s", strerror (errno));
+			ret = ASPAMD_ERR_IO;
+			goto at_exit;
+		}
+	}
+
+	bytes = write (sock, sample->body, sample->length);
 	if (bytes == -1)
 	{
 		g_critical ("write failed: %s", strerror (errno));
@@ -394,17 +418,27 @@ static void dump_buffer (const gchar *buffer, gint size)
 	g_free (clean_string);
 }
 
-gint sock_loop ()
+void *sock_loop ()
 {
-	gint ret = ASPAMD_ERR_OK;
+	gint ret = ASPAMD_ERR_OK, i = 1;
 	gint sock = -1, messages_num, buggy_msg_num, refused = 0;
-	sample_message_t *sample = NULL;
+	sample_message_t *sample = NULL, user_sample;
 	gint dice;
+	GDir *dir = NULL;
+	const gchar *file;
+	gchar *file_path;
 
 	for (messages_num = 1; messages[messages_num - 1].body; messages_num++);
 	for (buggy_msg_num = 1; buggy_messages[buggy_msg_num - 1].body; buggy_msg_num++);
 
 	g_debug ("messages - %i, buggy messages - %i", messages_num, buggy_msg_num);
+
+	if (msg_dir != NULL) {
+		if ((dir = g_dir_open(msg_dir, 0, NULL)) == NULL) {
+			g_critical ("Failed to open directory %s\n", msg_dir);
+			return NULL;
+		}
+	}
 
 	running = 1;
 	while (running)
@@ -431,40 +465,69 @@ gint sock_loop ()
 			
 		}
 		refused = 0;
-		
-		if (client_manner == TEST_CLNT_CLEVER)
-			sample = &messages[random () % (messages_num - 1)];
-		else if (client_manner == TEST_CLNT_BUGGY)
-		{
-			dice = random () % 100;
-			if (dice >= 0 && dice < 33)
+
+		if (dir != NULL) {
+			file = g_dir_read_name(dir);
+			if (file == NULL) {
+				if ( i >= iteration)
+					break;
+				g_dir_rewind(dir);
+				file = g_dir_read_name(dir);
+				i++;
+			}
+			file_path = g_build_filename(msg_dir, file, NULL);
+			if (file_path == NULL) {
+				g_critical ("Failed to set file path %s\n", file);
+				running = 0;
+				goto at_exit;
+			}
+			sample = &user_sample;
+			if (!g_file_get_contents(file_path, &sample->body, &sample->length, NULL)) {
+				g_critical ("Failed to read file content %s\n", file);
+				g_free(file_path);
+				running = 0;
+				goto at_exit;
+			}
+			g_free(file_path);
+			sample->type = message_user;
+		} else {
+			if (client_manner == TEST_CLNT_CLEVER)
 				sample = &messages[random () % (messages_num - 1)];
-			else if (dice >= 33 && dice < 66)
+			else if (client_manner == TEST_CLNT_BUGGY)
 			{
-				sample = &buggy_messages[random () % (buggy_msg_num - 1)];
-				g_message ("behaving buggy: buggy message");
+				dice = random () % 100;
+				if (dice >= 0 && dice < 33)
+					sample = &messages[random () % (messages_num - 1)];
+				else if (dice >= 33 && dice < 66)
+				{
+					sample = &buggy_messages[random () % (buggy_msg_num - 1)];
+					g_message ("behaving buggy: buggy message");
+				}
+				else
+				{
+					sample = NULL;
+					g_message ("behaving buggy: no message");
+				}
 			}
-			else
-			{
-				sample = NULL;
-				g_message ("behaving buggy: no message");
-			}
+			sample->length = strlen(sample->body);
 		}
 
 		if (sample)
 		{
 			g_debug ("sample type - %i, rating - %i, size - %i",
-				 sample->type, sample->rating, (int) strlen (sample->body));
+				 sample->type, sample->rating, sample->length);
 
 			ret = write_request (sock, sample);
 			ASPAMD_ERR_CHECK (ret);
 
-			if (client_manner == TEST_CLNT_BUGGY)
-			{
-				if (random () % 100 > 50)
+			if (msg_dir == NULL) {
+				if (client_manner == TEST_CLNT_BUGGY)
 				{
-					g_message ("behaving buggy: reply is skipped");
-					goto at_exit;
+					if (random () % 100 > 50)
+					{
+						g_message ("behaving buggy: reply is skipped");
+						goto at_exit;
+					}
 				}
 			}
 		}
@@ -472,8 +535,13 @@ gint sock_loop ()
 		ret = read_reply (sock);
 		ASPAMD_ERR_CHECK (ret);
 
-		ret = check_reply (sample);
-		ASPAMD_ERR_CHECK (ret);
+		if (msg_dir == NULL) {
+			ret = check_reply (sample);
+			ASPAMD_ERR_CHECK (ret);
+		} else {
+			g_free(sample->body);
+		}
+
 at_exit:
 		if (sock > 0 )
 		{
@@ -481,20 +549,27 @@ at_exit:
 			sock = -1;
 		}
 		assassin_parser_reset (parser);
-		if (ret != ASPAMD_ERR_OK && client_manner == TEST_CLNT_CLEVER)
-		{
+		if (msg_dir == NULL) {
+			if (ret != ASPAMD_ERR_OK && client_manner == TEST_CLNT_CLEVER)
+			{
+				dump_buffer (buffer, MIN (buffer_filling, (TEST_BUFFER_SIZE - 1)));
+				running = 0;
+			}
+			else
+				random_delay (client_rate);
+		} else {
 			dump_buffer (buffer, MIN (buffer_filling, (TEST_BUFFER_SIZE - 1)));
-			running = 0;
 		}
-		else
-			random_delay (client_rate);
 	}
 	g_debug ("connections refused - %i", stats.refused);
 	g_debug ("messages sent - %i", stats.msgs);
 	g_debug ("error messages sent - %i", stats.err_msgs);
 	g_debug ("pings sent - %i", stats.pings);
 
-	return ret;
+	if (dir != NULL)
+		g_dir_close(dir);
+
+	return NULL;
 }
 
 void sig_handler (int sig_no)
@@ -567,13 +642,25 @@ void deinitialize ()
 
 int main (int argc, char *argv[])
 {
-	gint ret = ASPAMD_ERR_OK;
+	gint ret = ASPAMD_ERR_OK, i;
+	pthread_t th[MAX_THREAD_NUM];
 
 	ret = initialize ();
 	ASPAMD_ERR_CHECK (ret);
 	ret = parse_com_line (argc, argv);
 	ASPAMD_ERR_CHECK (ret);
-	sock_loop ();
+
+	if (threads > MAX_THREAD_NUM) {
+		g_critical ("Maximum thread number exceeded\n");
+		return ret;
+	}
+
+	for (i = 0; i < threads; i++)
+		pthread_create(&th[i], NULL, sock_loop, NULL);
+
+	for (i = 0; i < threads; i++)
+		pthread_join(th[i], NULL);
+
 at_exit:
 	deinitialize ();
 	return ret;

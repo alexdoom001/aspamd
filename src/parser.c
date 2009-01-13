@@ -459,7 +459,7 @@ static gint parse_headers (assassin_parser_t *parser, const gchar *buffer,
 			*completed = 1;
 			goto at_exit;
 		default:
-			match = g_match_info_next (match_info, &gerr);
+			g_match_info_next (match_info, &gerr);
 			ASPAMD_ERR_IF (gerr, ASPAMD_ERR_PARSER,
 				       "parser %p: header parsing error: %s",
 				       parser, gerr->message);

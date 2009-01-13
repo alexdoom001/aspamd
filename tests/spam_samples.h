@@ -12,14 +12,16 @@ enum
 	message_not_spam,
 	message_ping,
 	message_error,
-	message_error_no_reply
+	message_error_no_reply,
+	message_user
 };
 
 struct sample_message
 {
 	gint type;
 	int rating;
-	const char *body;
+	char *body;
+	gsize length;
 };
 
 typedef struct sample_message sample_message_t;

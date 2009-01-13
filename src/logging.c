@@ -72,7 +72,7 @@ static void aspamd_log_stdio_handler (const gchar *log_domain,
 			      "%s[%s]: %s\n", log_domain,
 			      aspamd_log_level_to_str (log_level),
 			      message);
-	bytes_written = fwrite (buffer, 1, offset, log->file);
+	fwrite (buffer, 1, offset, log->file);
 }
 
 /** @brief syslog backend

@@ -46,6 +46,17 @@ enum
 	handler_state_reused
 };
 
+static void populate_poll_fd(aspamd_reactor_t *reactor, reactor_handler_t *handler)
+{
+	handler->poll_fd->fd = handler->fd;
+	handler->poll_fd->events = handler->mask;
+	handler->poll_fd->revents = 0;
+	g_debug ("reactor %p: fd %i is added, mask - 0%o, "
+		 "associated data - %p", reactor,
+		 handler->fd, handler->mask, handler->data);
+	handler->state = handler_state_linked;
+}
+
 static gint reactor_rebuild_poll (aspamd_reactor_t *reactor)
 {
 	gint ret = ASPAMD_ERR_OK;
@@ -59,17 +70,6 @@ static gint reactor_rebuild_poll (aspamd_reactor_t *reactor)
 
 	if (!reactor->rebuild)
 		return ret;
-
-	void populate_poll_fd(reactor_handler_t *handler)
-	{
-		handler->poll_fd->fd = handler->fd;
-		handler->poll_fd->events = handler->mask;
-		handler->poll_fd->revents = 0;
-		g_debug ("reactor %p: fd %i is added, mask - 0%o, "
-			 "associated data - %p", reactor,
-			 handler->fd, handler->mask, handler->data);
-		handler->state = handler_state_linked;
-	}
 
 	if (reactor->stale)
 	{
@@ -107,7 +107,7 @@ static gint reactor_rebuild_poll (aspamd_reactor_t *reactor)
 			reactor->new = g_slist_remove (reactor->new,
 						       (gconstpointer) handler);
 			handler->poll_fd = &fds[i];
-			populate_poll_fd (handler);
+			populate_poll_fd (reactor, handler);
 			stale_length --;
 		}
 		else
@@ -147,7 +147,7 @@ static gint reactor_rebuild_poll (aspamd_reactor_t *reactor)
 			g_assert (handler);
 			g_assert (reactor->active_fds < reactor->num_fds);
 			handler->poll_fd = &fds[reactor->active_fds++];
-			populate_poll_fd (handler);
+			populate_poll_fd (reactor, handler);
 		}
 		g_slist_free (reactor->new);
 		reactor->new = NULL;
@@ -178,23 +178,6 @@ static gint reactor_invoke_callback (aspamd_reactor_t *reactor, gint type, gint 
 	struct pollfd *fds = NULL;
 	time_t timestamp;
 	gint idle, timeout;
-
-	gint handler_check_idle (reactor_handler_t *handler, gint *handler_ret,
-				 gint *timeout_)
-	{
-		gint timeout = timestamp - handler->timestamp;
-		gint ret = 0;
-
-		if (handler->idle && 
-		    handler->timeout >= 0 &&
-		    timeout > handler->timeout)
-		{
-			ret = 1;
-			*handler_ret = handler->idle (handler->data, fds[i].fd,
-						      timeout_);
-		}
-		return ret;
-	}
 
 	g_assert (reactor);
 
@@ -238,12 +221,18 @@ static gint reactor_invoke_callback (aspamd_reactor_t *reactor, gint type, gint 
 					handler_ret = handler->io (handler->data, fds[i].fd,
 								   (gpointer)&io_param);
 				}
+				break;
 			}
-			else
-				idle = handler_check_idle (handler, &handler_ret, &timeout);
-			break;
+			/* else fallthrough as if idle */
 		case REACTOR_CB_IDLE:
-			idle = handler_check_idle (handler, &handler_ret, &timeout);
+			if (handler->idle &&
+			    handler->timeout >= 0 &&
+			    (timestamp - handler->timestamp) > handler->timeout) {
+				idle = 1;
+				handler_ret = handler->idle(handler->data, fds[i].fd,
+							    &timeout);
+			} else
+				idle = 0;
 			break;
 		case REACTOR_CB_CLOSE:
 			if (handler->close)
@@ -347,7 +336,7 @@ gint reactor_set_handler (aspamd_reactor_t *reactor, gint fd, gint type,
 	else
 		ASPAMD_ERR (ASPAMD_ERR_PARAM, 
 			    "reactor %p: failed to change callback of fd %i: "
-			    "one is not added", reactor, handler->fd);
+			    "one is not added", reactor, fd);
 at_exit:
 	g_mutex_unlock (reactor->lock);
 	return ret;
@@ -621,7 +610,7 @@ void aspamd_reactor_free (aspamd_reactor_t *reactor)
 
 	if (reactor->lock)
 	{
-		g_free (reactor->lock);
+		g_mutex_free (reactor->lock);
 		reactor->lock = NULL;
 	}
 

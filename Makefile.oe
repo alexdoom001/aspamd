@@ -5,12 +5,12 @@ ifndef KAS_DIR
 KAS_DIR =  ../KAS_SDK5
 endif
 
-CFLAGS += -O2 -g \
+AS_CFLAGS = -O2 -g \
 	-I $(KAS_DIR)/include -Isrc -DG_LOG_DOMAIN=\"aspamd\" \
 	-I.
 
-LDFLAGS += -g \
-	-L$(KAS_DIR)/lib -Wl,-rpath,$(KAS_DIR)/lib \
+AS_LDFLAGS = -g \
+	-L$(KAS_DIR)/lib \
 	-lgthread-2.0 -lglib-2.0 -lkassdk -lpthread
 
 TARGET = aspamd
@@ -21,16 +21,22 @@ SRC = logging parser assassin pairs aspamd server \
 OBJS = $(addprefix src/, $(addsuffix .o, $(SRC)))
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(AS_CFLAGS) -c $< -o $@
 
 $(TARGET): $(OBJS)
-	$(LD) $(LDFLAGS) $(OBJS) -o $(TARGET)
+	$(LD) $(LDFLAGS) $(AS_LDFLAGS) $(OBJS) -o $(TARGET)
 
 all: $(TARGET)
 
 install:
 	cp -f $(TARGET) $(PREFIX)/sbin
-	cp -f aspamd.conf $(PREFIX)/etc
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+
+spamd_test_CFLAGS = $(CFLAGS) -Isrc -Itests -I. -DG_LOG_DOMAIN=\"spamd_test\"
+spamd_test_LDFLAGS = $(LDFLAGS) -lglib-2.0
+
+spamd_test: src/parser.c src/assassin.c src/pairs.c src/logging.c \
+	tests/spam_samples.c tests/spamd_test.c
+	$(CC) $(spamd_test_CFLAGS) -o $@ $^ $(spamd_test_LDFLAGS)
